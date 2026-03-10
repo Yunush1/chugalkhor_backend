@@ -16,7 +16,6 @@ app.use(cookieParser());
  * ===============================
  */
 app.use(helmet()); // Security headers
-
 app.use(corsMiddleware);
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: true }));

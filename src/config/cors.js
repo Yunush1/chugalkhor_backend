@@ -19,7 +19,7 @@ const corsOptions = {
         if (allowedOrigins.includes(origin) || fallbackOrigins.includes(origin)) {
             return callback(null, true);
         } else {
-            console.warn(`CORS blocked for origin: ${origin}`);
+            logger.warn(`CORS blocked for origin: ${origin}`);
             return callback(new Error('Not allowed by CORS'));
         }
     },
