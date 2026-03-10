@@ -1,8 +1,10 @@
 const cors = require('cors');
+const logger = require('../utils/logger');
 const allowedOrigins = (process.env.CLIENT_URLS || '')
     .split(',')
     .map(origin => origin.trim())
     .filter(origin => origin.length > 0);
+logger.info(`[CORS config] allowed origins ${JSON.stringify(allowedOrigins)}`)
 const fallbackOrigins = [
     'http://localhost:3000',
     'https://book-swapping.netlify.app',
@@ -12,6 +14,7 @@ const fallbackOrigins = [
 const corsOptions = {
 
     origin: function (origin, callback) {
+        logger.info(`[Cors options] corsOptions origin ${JSON.stringify(origin)}`)
         if (!origin) return callback(null, true);
         if (allowedOrigins.includes(origin) || fallbackOrigins.includes(origin)) {
             return callback(null, true);
