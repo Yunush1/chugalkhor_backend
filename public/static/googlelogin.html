@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="
+  script-src 'self' https://accounts.google.com 'unsafe-inline';
+  style-src 'self' 'unsafe-inline';
+  connect-src 'self' https://accounts.google.com;
+  frame-src https://accounts.google.com;
+">
+    <title>Google Login - Verify</title>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacOSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f8f9fa;
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            background: white;
+            padding: 2.5rem 2rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 420px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #1a1a1a;
+            margin-bottom: 0.5rem;
+            font-size: 1.8rem;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 2rem;
+            font-size: 1rem;
+        }
+
+        #googleSignInButton {
+            margin: 1.5rem auto;
+        }
+
+        #status {
+            margin-top: 1.5rem;
+            min-height: 1.5rem;
+            font-weight: 500;
+        }
+
+        .success {
+            color: #28a745;
+        }
+
+        .error {
+            color: #dc3545;
+        }
+
+        .info {
+            color: #007bff;
+        }
+
+        .user-info {
+            margin-top: 2rem;
+            text-align: left;
+            background: #f1f3f5;
+            padding: 1.2rem;
+            border-radius: 8px;
+            display: none;
+        }
+
+        .user-info img {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            margin-bottom: 1rem;
+        }
+
+        .user-info h3 {
+            margin: 0.5rem 0;
+            color: #333;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <h1>Sign in</h1>
+        <p class="subtitle">Continue with your Google account</p>
+
+        <!-- Google Sign-In button will be placed here -->
+        <div id="googleSignInButton"></div>
+
+        <div id="status" class="info">Waiting for login...</div>
+
+        <div class="user-info" id="userInfo">
+            <img id="userPicture" src="" alt="Profile" />
+            <h3 id="userName"></h3>
+            <p id="userEmail"></p>
+            <small id="userId"></small>
+        </div>
+    </div>
+
+    <!-- 
+    Google Identity Services script 
+    (use your own Client ID from Google Cloud Console)
+  -->
+    <script nonce="rAnd0mN0nc3Valu3==" src="https://accounts.google.com/gsi/client" async defer></script>
+
+
+
+    <script nonce="rAnd0mN0nc3Valu3==">
+        // Replace with YOUR Google OAuth 2.0 Client ID
+        const GOOGLE_CLIENT_ID = "359759022181-bsdr471rua7oro2u19m4kqcnijbki6oe.apps.googleusercontent.com";
+
+        window.onload = function () {
+            google.accounts.id.initialize({
+                client_id: GOOGLE_CLIENT_ID,
+                callback: handleGoogleSignIn,
+                auto_select: false,           // optional: show One Tap if possible
+                cancel_on_tap_outside: true,
+            });
+
+            google.accounts.id.renderButton(
+                document.getElementById("googleSignInButton"),
+                {
+                    theme: "outline",           // "outline" | "filled_blue" | "filled_black"
+                    size: "large",              // "large" | "medium" | "small"
+                    text: "signin_with",        // "signin_with" | "continue_with" | "signup_with"
+                    shape: "rectangular",
+                    logo_alignment: "left",
+                    width: 300,
+                }
+            );
+
+            // Optional: One Tap prompt
+            // google.accounts.id.prompt();
+        };
+
+        function handleGoogleSignIn(response) {
+            // response.credential = JWT ID token
+            const statusEl = document.getElementById("status");
+            statusEl.textContent = "Verifying...";
+            statusEl.className = "info";
+
+            // You can now send this token to your backend
+            console.log("Google ID Token:", response.credential);
+
+            // Decode token (client-side - only for demo - do NOT trust this in production!)
+            try {
+                const payload = JSON.parse(atob(response.credential.split('.')[1]));
+
+                const userInfo = document.getElementById("userInfo");
+                document.getElementById("userName").textContent = payload.name;
+                document.getElementById("userEmail").textContent = payload.email;
+                document.getElementById("userPicture").src = payload.picture;
+                document.getElementById("userId").textContent = "Google ID: " + payload.sub;
+
+                userInfo.style.display = "block";
+
+                statusEl.textContent = "Login successful!";
+                statusEl.className = "success";
+
+                // === Most important part: Send token to your backend ===
+                sendTokenToBackend(response.credential);
+
+            } catch (err) {
+                console.error("Token decode error:", err);
+                statusEl.textContent = "Error processing login";
+                statusEl.className = "error";
+            }
+        }
+
+        async function sendTokenToBackend(idToken) {
+            try {
+                const response = await fetch("http://localhost:5000/api/auth/google/login", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({ idToken }),
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    console.log("Backend success:", data);
+                    document.getElementById("status").textContent += " — Backend verified!";
+                    // You can store JWT, redirect, etc.
+                    // window.location.href = "/dashboard";
+                } else {
+                    throw new Error(data.message || "Backend error");
+                }
+            } catch (err) {
+                console.error("Backend login failed:", err);
+                document.getElementById("status").textContent = "Login failed: " + err.message;
+                document.getElementById("status").className = "error";
+            }
+        }
+    </script>
+
+</body>
+
+</html>
