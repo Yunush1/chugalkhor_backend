@@ -3,11 +3,14 @@ const socketAuthMiddleware = require('../middlewares/socket.auth');
 const logger = require('../utils/logger');
 const Enums = require('../utils/constants');
 const handleChatMessageEvents = require('../socketService/events/handleChatMessageEvents');
+const handleCallEvents = require('../socketService/events/handleCallEvents');
+const wavecall = require('wavecall-server');
+const WaveCallSignaling = wavecall.WaveCallSignaling || wavecall.default?.WaveCallSignaling;
 
 class SocketManager {
     constructor() {
         this.io = null,
-            this.userSockets = new Map();
+        this.userSockets = new Map();
         this.onlineUsers = new Set();
         this.onlineAdmins = new Set();
 
@@ -16,6 +19,8 @@ class SocketManager {
         this.activeSessions = new Map();
         this.sessionTimeouts = new Map();
         this.disconnectTimeouts = new Map();
+
+        this.signaling = null;
     }
 
     initialize(server) {
@@ -30,6 +35,17 @@ class SocketManager {
                 skipMiddlewares: true
             }
         })
+
+        this.signaling = new WaveCallSignaling({
+            secret: process.env.WAVECALL_SECRET,
+            onCallStarted: ({ callId, roomId, callType, initiatorId }) => {
+                logger.info(`[WaveCall] Call started callId=${callId} roomId=${roomId} type=${callType} by=${initiatorId}`);
+            },
+            onCallEnded: ({ callId, roomId, reason }) => {
+                logger.info(`[WaveCall] Call ended callId=${callId} roomId=${roomId} reason=${reason}`);
+            },
+        });
+
         this.io.use(socketAuthMiddleware)
 
         this.io.on('connection', (socket) => {
@@ -44,6 +60,7 @@ class SocketManager {
                 socket.join('admins');
             }
             handleChatMessageEvents(this, socket);
+            handleCallEvents(this, socket)
             this.broadcastOnlineLists();
             socket.on('disconnect', () => {
                 this.cleanup(userId, socket.id, role);

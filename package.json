@@ -35,6 +35,7 @@
     "openai": "^6.27.0",
     "path": "^0.12.7",
     "socket.io": "^4.8.3",
+    "wavecall-server": "^1.0.0",
     "winston": "^3.19.0"
   },
   "devDependencies": {
