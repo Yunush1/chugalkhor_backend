@@ -47,7 +47,7 @@ class MessageRepository {
         return Message.find({ roomId })
             .sort({ createdAt: -1 })
             .limit(limit)
-            .populate("sender", "username isBot")
+            .populate("sender", "name username isBot")
             .lean();
     }
 }

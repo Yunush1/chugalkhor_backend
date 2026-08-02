@@ -3,19 +3,11 @@ const Message = require('../../models/message');
 const Room = require('../../models/room');
 const MessageRepository = require('../../repositories/MessageRepository');
 const Enums = require('../../utils/constants');
-const axios = require('axios');
-const { default: axiosRetry } = require('axios-retry');
+const AIService = require('../aiService');
+const OfflineReplyService = require('./OfflineReplyService');
+
 // Tracks whether a room has an active bot chain running
 // roomId (string) → true | false
-
-axiosRetry(axios, {
-    retries: 3, // Retry 3 times
-    retryDelay: (retryCount) => retryCount * 1000, // 1s, 2s, 3s
-    retryCondition: (error) => {
-        // Retry on 500 errors or network errors
-        return error.response?.status >= 500 || error.code === 'ECONNABORTED';
-    }
-});
 const activeRooms = new Map();
 
 class ConversationOrchestrator {
@@ -61,8 +53,13 @@ class ConversationOrchestrator {
 
     static async _runChain({ roomId, room, bots, senderName, triggerMessage, emitter, round }) {
         const MAX_ROUNDS = 6;
+        const OFFLINE_MAX_ROUNDS = 2;
 
-        if (!activeRooms.get(roomId) || round >= MAX_ROUNDS) return;
+        // Offline replies come from a fixed bank, so a long chain would start
+        // repeating itself. Keep the room alive, but keep it short.
+        const maxRounds = AIService.isAvailable() ? MAX_ROUNDS : OFFLINE_MAX_ROUNDS;
+
+        if (!activeRooms.get(roomId) || round >= maxRounds) return;
 
         const recentMessages = await MessageRepository.getRecentMessages(roomId, 20);
 
@@ -79,7 +76,7 @@ class ConversationOrchestrator {
         const recentBotReplies = recentMessages
             .filter(m => m.sender?.isBot)
             .slice(-6)
-            .map(m => `${m.sender?.name}: ${m.content}`);
+            .map(m => `${m.sender?.name || m.sender?.username || 'someone'}: ${m.content}`);
 
         const chainMessages = [];
 
@@ -103,6 +100,7 @@ class ConversationOrchestrator {
                 senderName, triggerMessage,
                 respondingBots,
                 isFirst: i === 0 && round === 0,
+                replyIndex: i,
                 round,
             });
 
@@ -140,14 +138,17 @@ class ConversationOrchestrator {
         const recentBotCount = recentMessages.filter(m => m.sender?.isBot).length;
         if (recentBotCount >= 5) return { respondingBots: ConversationOrchestrator._pickBots(activeBots, 1) };
 
+        // Office chugli that the whole room piles onto.
         const crowdTriggers = [
-            /not well|sick|sad|depressed|upset|breakup|broke up|she left|he left|alone|lonely|miss|bored|boring|pain|dard|headache|sir dard/i,
-            /help|please|anyone|somebody|advice|suggest|kya kru|kya karun|batao/i,
-            /😢|😭|💔|😔|🥺|😞|😑|🤕|😩/,
+            /boss|manager|senior|team lead|\btl\b|\bhr\b|appraisal|hike|increment|promotion|salary|package|bonus/i,
+            /resign|notice period|fired|layoff|laid off|nikaal|nikal diya|quit|switch|offer letter|interview/i,
+            /overtime|late night|weekend|deadline|onsite|client call|standup|meeting|politics|credit liya|blame/i,
+            /not well|sad|upset|frustrated|pareshan|tang aa|thak gaya|fed up|bore|bored|dard/i,
+            /😤|😡|🤬|😩|😭|💀|🙄|😔/,
         ];
         const duoTriggers = [
             /\?/,
-            /what do you|anyone know|thoughts|opinion|what should|kya lagta|sochte ho/i,
+            /what do you|anyone know|thoughts|opinion|what should|kya lagta|sochte ho|batao/i,
             /hey|yo |sup |hii|hello|anyone|koi hai/i,
         ];
 
@@ -170,7 +171,7 @@ class ConversationOrchestrator {
 
     static async _generateBotReply({
         bot, room, recentMessages, chainMessages, recentBotReplies,
-        triggerMessage, senderName, respondingBots, isFirst, round,
+        triggerMessage, senderName, respondingBots, isFirst, replyIndex = 0, round,
     }) {
         try {
             // Build clean conversation history — label each person by name
@@ -197,14 +198,44 @@ class ConversationOrchestrator {
             const prompt = ConversationOrchestrator._buildPrompt({
                 bot, room, senderName, otherBotNames,
                 history, chainContext, recentBotContext,
-                triggerMessage, isFirst, round,
+                triggerMessage, isFirst, replyIndex, round,
             });
 
-            const rawText = await ConversationOrchestrator._callGemini(prompt);
-            if (!rawText) return null;
+            // The prompt carries persona, rules and the transcript, so it goes in as
+            // the system instruction; the chat turn is what the bot is replying to.
+            const rawText = await AIService.chat({
+                system: prompt,
+                messages: [{
+                    role: 'user',
+                    content: round === 0 && triggerMessage
+                        ? `${senderName}: ${triggerMessage}`
+                        : (recentMessages[0]
+                            ? `${recentMessages[0].sender?.name || recentMessages[0].sender?.username || 'someone'}: ${recentMessages[0].content}`
+                            : `${senderName}: ${triggerMessage || 'Hey!'}`),
+                }],
+                // A chugli line is ~25 tokens; the headroom is only there so a
+                // reply never gets cut off mid-word.
+                maxTokens: 80,
+                temperature: 0.9,
+                topP: 0.95,
+                label: bot.name,
+            });
+            // Provider down (no credits, bad key, outage) — answer from the local
+            // bank instead of leaving the room dead.
+            const replyText = rawText ?? OfflineReplyService.generate({
+                bot,
+                roomId: room._id,
+                message: round === 0 ? triggerMessage : (recentMessages[0]?.content ?? triggerMessage),
+                replyIndex,
+                round,
+                alreadySaid: recentBotReplies,
+            });
+
+            if (!replyText) return null;
+            if (!rawText) logger.info(`[Orchestrator] ${bot.name} replied from the offline bank`);
 
             // Aggressively clean the output
-            let cleanText = rawText.trim()
+            let cleanText = replyText.trim()
                 .replace(/^["']|["']$/g, '')           // remove wrapping quotes
                 .replace(/^[A-Za-z\s]{1,20}:\s/, '')   // remove "Name: " prefix
                 .replace(/\*+/g, '')                    // remove markdown bold
@@ -242,138 +273,98 @@ class ConversationOrchestrator {
         }
     }
 
-    // ─── Gemini API ──────────────────────────────────────────────────────────
-
-    static async _callGemini(prompt, botName = 'Rahul') {
-        try {
-            const apiKey = process.env.GEMINI_API_KEY;
-            if (!apiKey) {
-                throw new Error('GEMINI_API_KEY not set in environment');
-            }
-
-            const response = await axios.post(
-                `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-                {
-                    contents: [
-                        {
-                            role: "user",  // Gemini mein role "user" ya "model" hota hai (system prompt ko contents mein daal sakte ho)
-                            parts: [{ text: prompt }]
-                        }
-                    ],
-                    generationConfig: {
-                        maxOutputTokens: 500,
-                        temperature: 0.9,
-                        topP: 0.95,
-                    },
-                    // Optional: system instruction add karne ke liye (Gemini mein system prompt alag field nahi, contents mein daalo)
-                    // systemInstruction: { parts: [{ text: "You are a fun casual friend..." }] }  // agar Gemini 1.5+ version support kare
-                },
-                {
-                    headers: { 'Content-Type': 'application/json' },
-                    timeout: 60000  // 60 sec – Gemini fast hai, isse zyada ki zaroorat nahi
-                }
-            );
-
-            // Gemini response safely extract
-            const candidates = response?.data?.candidates;
-            if (!candidates || candidates.length === 0) {
-                throw new Error('No candidates in Gemini response');
-            }
-
-            const parts = candidates[0]?.content?.parts;
-            if (!parts || parts.length === 0 || !parts[0]?.text) {
-                throw new Error('No text content in Gemini response');
-            }
-
-            const botReply = parts[0].text.trim();
-
-            console.log(`[${botName}] Gemini Reply:`, botReply);
-            // Optional debug
-            // console.log('Full Gemini response:', JSON.stringify(response.data, null, 2));
-
-            return botReply;
-
-        } catch (error) {
-            console.error(`Gemini API failed for ${botName}:`, {
-                message: error.message,
-                code: error.code,
-                status: error.response?.status,
-                data: error.response?.data || null
-            });
-
-            // Fallback reply taaki room mein dead vibe na aaye
-            return `Arre yaar sorry, thoda connection glitch 😅 Ab bata, kya bol raha tha?`;
-        }
-    }
     // ─── Prompt Building ─────────────────────────────────────────────────────
 
     static _getPersonalityStyle(personalityEnum) {
         const { PERSONALITY } = Enums.USER;
         const styles = {
             [PERSONALITY.FRIENDLY]: {
-                style: 'warm desi friend who genuinely cares',
+                style: 'warm colleague who takes your side instantly and shares the same struggles',
                 examples: [
-                    'arre yaar kya hua bata na',
-                    'chal thoda paani pi aur le',
-                    'tu theek ho jayega, hum hai na',
-                    'aww sach mein? kab se hai?',
-                    'bhai rest kar thoda, kaam baad mein hoga',
+                    'arre yaar aisa boss kaha se milta hai tujhe',
+                    'same haal hai mera bhi, mera TL bhi aisa hi karta hai',
+                    'tu bol na, exactly kya bola usne',
+                    'chhod yaar, weekend pe bhool jaana',
+                    'itna kaam karwate hai aur hike ke naam pe zero',
                 ],
             },
             [PERSONALITY.FUNNY]: {
-                style: 'sarcastic desi guy who jokes about everything but secretly cares',
+                style: 'sarcastic corporate guy who roasts office life but is secretly on your side',
                 examples: [
-                    'bhai tera toh life hi ek tragedy hai 😂',
-                    'chal ab rona band kar, chai pi',
-                    'headache hai ya bas excuse dhundh raha hai? 😏',
-                    'yaar teri problem sun ke meri bhi headache aa gayi',
-                    'sympathy toh dunga lekin pehle bata kya kiya tune',
+                    'bhai teri company NGO hai kya, salary hi nahi deti 😂',
+                    'standup meeting hai ya standup comedy',
+                    'hike mila ya sirf "great work" mila',
+                    'manager ne credit le liya na? classic move',
+                    'resign kar de, chai ki tapri khol lete hai saath mein',
                 ],
             },
             [PERSONALITY.CURIOUS]: {
-                style: 'nosy desi girl who wants all the details and reacts dramatically',
+                style: 'nosy colleague who wants every single detail of the story',
                 examples: [
-                    'arre wait headache kyun?? kya hua??',
-                    'bhai poori story bata, se shuru kar',
-                    'ohhh seriously?? aur aur??',
-                    'yaar kab se ho raha hai ye sab',
-                    'nahi nahi poora bata mujhe',
+                    'ruk ruk, kisne bola ye? naam bata',
+                    'aur phir?? HR ne kya kaha??',
+                    'kis team mein hai tu, poora scene bata',
+                    'seriously?? sabke saamne bola??',
+                    'aur uska reaction kya tha uske baad',
                 ],
             },
             [PERSONALITY.QUITE]: {
-                style: 'quiet observer who says very little but hits hard when they do',
+                style: 'quiet senior who says almost nothing but lands one savage line',
                 examples: [
-                    'rest kar.',
-                    'paracetamol liya?',
-                    'hm.',
-                    'kal theek hoga.',
-                    'chal so ja.',
+                    'resign kar.',
+                    'classic manager move.',
+                    'sab mail pe documented rakh.',
+                    'hm. politics.',
+                    'notice period kitna hai?',
                 ],
             },
         };
         return styles[personalityEnum] ?? styles[Enums.USER.PERSONALITY.FRIENDLY];
     }
 
-    static _buildPrompt({ bot, room, senderName, otherBotNames, history, chainContext, recentBotContext, triggerMessage, isFirst, round }) {
+    // Left to themselves every bot picks the same move — three "same haal hai
+    // mera bhi" in a row. Assigning one move per slot in the chain makes the
+    // room sound like a conversation instead of an echo.
+    static _getMove(replyIndex, round) {
+        const moves = [
+            'React to what they just said — tease them, agree hard, or roast the boss. Do NOT ask a question.',
+            'Ask ONE nosy follow-up question to pull more details out of them. Do NOT add commentary.',
+            'Top it with ONE line about YOUR own office. Do NOT ask a question.',
+        ];
+        return moves[(replyIndex + round) % moves.length];
+    }
+
+    static _buildPrompt({ bot, room, senderName, otherBotNames, history, chainContext, recentBotContext, triggerMessage, isFirst, replyIndex = 0, round }) {
         const { style, examples } = ConversationOrchestrator._getPersonalityStyle(bot.botProfile?.personality);
         const isQuiet = bot.botProfile?.personality === Enums.USER.PERSONALITY.QUITE;
         const exampleList = examples.map(e => `- "${e}"`).join('\n');
 
         const othersLine = otherBotNames.length > 0
-            ? `Other people in chat: ${otherBotNames.join(', ')}.`
+            ? `Others in the chat right now: ${otherBotNames.join(', ')}.`
+            : '';
+
+        // The bot's own workplace — this is the material it gossips *back* with,
+        // so the room feels like strangers swapping office stories, not a helpdesk.
+        const officeLine = bot.botProfile?.persona
+            ? `--- YOUR OWN OFFICE (your material for chugli) ---\n${bot.botProfile.persona}`
             : '';
 
         let taskLine;
         if (round === 0 && isFirst) {
-            taskLine = `${senderName} just said: "${triggerMessage}"\nYou are the first to reply. React to ${senderName} directly.`;
+            taskLine = `${senderName} just said: "${triggerMessage}"\nYou are first to react. Respond to ${senderName} directly.`;
         } else if (round === 0) {
-            taskLine = `${senderName} said: "${triggerMessage}"\nSomeone already replied. React differently — add your own take, don't echo what was said.`;
+            taskLine = `${senderName} said: "${triggerMessage}"\nSomeone already reacted. Say something the others have not.`;
         } else {
-            taskLine = `The group chat is flowing. React to the latest messages. Keep the convo alive — joke, ask something, share a take, or bring ${senderName} back in.`;
+            taskLine = `The chugli is flowing. React to the latest message in the chat.`;
         }
 
-        return `You are ${bot.name}, a ${style} in a WhatsApp-style group chat called "${room.name}".
-${room.description ? `Group vibe: ${room.description}` : ''}
+        return `You are ${bot.name}, a real working professional in "${room.name}" — an anonymous group chat where people come to do CHUGLI about their offices: bosses, managers, HR, colleagues, appraisals, office politics, all of it.
+${room.description ? `Room vibe: ${room.description}` : ''}
+Nobody here knows each other in real life, so everyone talks freely about their workplace.
+
+${officeLine}
+
+You are a ${style}.
 
 ${othersLine}
 
@@ -384,20 +375,24 @@ ${chainContext ? `\n[Just now]\n${chainContext}` : ''}
 --- YOUR TASK ---
 ${taskLine}
 
---- YOUR STYLE (examples of how YOU talk) ---
+YOUR MOVE THIS TURN (do exactly this, nothing else):
+${ConversationOrchestrator._getMove(replyIndex, round)}
+
+--- HOW YOU TALK (tone reference only) ---
 ${exampleList}
 
 --- STRICT RULES ---
-1. Write ONLY your message — no name prefix, no quotes around it
-2. ${isQuiet ? 'Maximum 8 words. Be blunt.' : 'Maximum 15 words. Keep it punchy.'}
-3. Sound like a real Indian person texting — casual, imperfect, genuine
-4. Mix Hindi/English naturally (Hinglish) if it feels natural — "yaar", "bhai", "arre", "na", "toh", "kya" etc.
-5. NEVER start with "Oh no" — that's generic AI talk
-6. NEVER repeat what anyone else already said
-7. NEVER use formal English — no "I understand", "that sounds difficult", "I hope you feel better"
-8. React differently from others — if someone asked a question, you comment; if someone commented, you ask or joke
-9. Use emojis sparingly — max 1, only if it fits naturally
-10. Each bot must sound different from each other
+1. ONE short line. ${isQuiet ? 'Maximum 8 words.' : 'Maximum 14 words.'} Never stack a comment AND a question
+2. The lines above show your TONE only — never copy them or reuse their wording
+3. Write ONLY your message — no name prefix, no quotes around it
+4. Sound like a real Indian working person texting — casual, imperfect, genuine
+5. Hinglish only if it comes out clean and natural — correct English is better than broken Hindi
+6. This is gossip, not therapy — never give HR-style advice
+7. NEVER repeat what anyone already said below, and never ask a question someone already asked
+8. NEVER start with "Oh no", and never use formal English ("I understand", "that sounds difficult")
+9. React differently from the others — if they asked a question, you comment instead
+10. At most 1 emoji, only if it fits naturally
+11. Never reveal you are an AI — you are just another employee venting after work
 
 --- THINGS THAT WERE ALREADY SAID (DO NOT REPEAT THESE) ---
 ${recentBotContext || 'nothing yet'}

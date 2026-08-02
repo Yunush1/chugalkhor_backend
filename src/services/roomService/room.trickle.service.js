@@ -21,7 +21,7 @@ const _activeJobs = new Map();
 
 class RoomTrickleService {
 
-   
+
     static startTrickle(roomId, location, opts = {}) {
         const roomIdStr = roomId.toString();
 
@@ -206,10 +206,12 @@ class RoomTrickleService {
                 },
                 {
                     $match: {
-                        _id: { $nin: existingMemberIds.map(id => {
-                            const mongoose = require("mongoose");
-                            return new mongoose.Types.ObjectId(id);
-                        })},
+                        _id: {
+                            $nin: existingMemberIds.map(id => {
+                                const mongoose = require("mongoose");
+                                return new mongoose.Types.ObjectId(id);
+                            })
+                        },
                     },
                 },
                 { $limit: 10 },

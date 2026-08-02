@@ -2,7 +2,8 @@ const MessageRepository = require('../../repositories/MessageRepository');
 const Room = require('../../models/room');
 const Message = require('../../models/message');
 const logger = require('../../utils/logger');
-const axios = require('axios');
+const AIService = require('../aiService');
+const OfflineReplyService = require('./OfflineReplyService');
 const Enums = require('../../utils/constants');
 
 class BotReplyService {
@@ -46,7 +47,7 @@ class BotReplyService {
             }))
             .filter(m => m.content.trim());
 
-        return await BotReplyService._callGemini(bot, room, history);
+        return await BotReplyService._callAI(bot, room, history);
     }
 
     /**
@@ -85,49 +86,40 @@ class BotReplyService {
         };
     }
 
-    // ─── Gemini API Call ─────────────────────────────────────────────────────
+    // ─── AI Call ─────────────────────────────────────────────────────────────
 
-    static async _callGemini(bot, room, history) {
+    static async _callAI(bot, room, history) {
         try {
-            const conversationText = history.length > 0
-                ? history.map(m => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${m.content}`).join('\n')
-                : 'User: Hey!';
+            const system = `You are ${bot.name}, a real working professional in "${room.name}" — an anonymous chat where people do CHUGLI about their offices: bosses, HR, appraisals, colleagues, office politics.
+${room.description ? `Room vibe: ${room.description}` : ''}
+${bot.botProfile?.persona ? `Your own office: ${bot.botProfile.persona}` : ''}
+Keep replies short and casual — 1 to 2 sentences max. Hinglish is natural here.
+This is gossip, not advice — react, tease, drop your own office story, ask nosy follow-ups.
+Never reveal you are an AI. Reply with your message only — no name prefix, no quotes.`;
 
-            const prompt = `You are ${bot.name}, a friendly local in a nearby chat room called "${room.name}".
-${room.description ? `Room topic: ${room.description}` : ''}
-${bot.botProfile?.persona ? `Your personality: ${bot.botProfile.persona}` : ''}
-Keep replies short, casual, and conversational — 1 to 2 sentences max.
-Never reveal you are an AI. Act like a real nearby person.
+            const rawText = await AIService.chat({
+                system,
+                messages: history,
+                maxTokens: 120,
+                temperature: 0.9,
+                topP: 0.95,
+                label: bot.name,
+            });
 
-Conversation:
-${conversationText}
+            const cleaned = rawText?.replace(/^[A-Za-z\s]+:\s/, '').trim();
+            if (cleaned) return cleaned;
 
-Your reply (do NOT include your name or a prefix):`;
-
-            const response = await axios.post(
-                `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-                {
-                    contents: [
-                        {
-                            parts: [{ text: prompt }]
-                        }
-                    ],
-                    generationConfig: {
-                        maxOutputTokens: 120,
-                        temperature: 0.9,
-                        topP: 0.95,
-                    }
-                },
-                {
-                    headers: { 'Content-Type': 'application/json' }
-                }
-            );
-
-            const rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text ?? null;
-            return rawText?.trim().replace(/^[A-Za-z\s]+:\s/, '') ?? null;
+            // Provider down — fall back to the local bank so the bot still speaks.
+            logger.info(`[BotReplyService] ${bot.name} replying from the offline bank`);
+            return OfflineReplyService.generate({
+                bot,
+                roomId: room._id,
+                message: history[history.length - 1]?.content ?? '',
+                alreadySaid: history.map(m => m.content),
+            });
 
         } catch (error) {
-            logger.error('[BotReplyService] Gemini API error:', error);
+            logger.error('[BotReplyService] AI reply generation failed:', error);
             return null;
         }
     }
